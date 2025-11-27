@@ -10,10 +10,11 @@ import concurrent.futures
 import time
 import re
 import requests
+from datetime import datetime
 
 # --- PAGE SETUP ---
 st.set_page_config(
-    page_title="MAS 联合研报终端 v4.3",
+    page_title="MAS 联合研报终端 v4.5",
     page_icon="🏦",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -71,6 +72,34 @@ SPECIFIC_MODELS = {
     "CHIEF": "moonshotai/Kimi-K2-Thinking"
 }
 
+# --- HOT TICKERS DATA (用于联想输入) ---
+HOT_TICKERS_MAP = {
+    "自定义输入": None,
+    "----------- 全球指数 -----------": None,
+    "恒生科技指数 (^HSTECH)": "^HSTECH",
+    "恒生指数 (^HSI)": "^HSI",
+    "纳斯达克100 (^NDX)": "^NDX",
+    "标普500 (^GSPC)": "^GSPC",
+    "上证指数 (000001.SS)": "000001.SS",
+    "----------- 热门美股 -----------": None,
+    "英伟达 (NVDA)": "NVDA",
+    "特斯拉 (TSLA)": "TSLA",
+    "苹果 (AAPL)": "AAPL",
+    "微软 (MSFT)": "MSFT",
+    "拼多多 (PDD)": "PDD",
+    "阿里巴巴 (BABA)": "BABA",
+    "----------- 热门港股 -----------": None,
+    "腾讯控股 (0700.HK)": "0700.HK",
+    "美团 (3690.HK)": "3690.HK",
+    "小米集团 (1810.HK)": "1810.HK",
+    "快手 (1024.HK)": "1024.HK",
+    "----------- 热门A股 -----------": None,
+    "贵州茅台 (600519.SS)": "600519.SS",
+    "宁德时代 (300750.SZ)": "300750.SZ",
+    "比亚迪 (002594.SZ)": "002594.SZ",
+    "东方财富 (300059.SZ)": "300059.SZ"
+}
+
 # --- STATE INITIALIZATION ---
 def init_state():
     defaults = {
@@ -85,7 +114,8 @@ def init_state():
         "retry_count": 0,
         "last_rework_field": None,
         "user_query": "",
-        "verification_fail": False
+        "verification_fail": False,
+        "selected_hot_ticker": "自定义输入"
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -97,7 +127,35 @@ init_state()
 with st.sidebar:
     st.title("🎛️ 控制台")
     st.success("✅ API 密钥已加载")
-    st.caption("Environment: Protected")
+    
+    st.divider()
+    
+    # Feature 1: 联想/速查功能
+    st.subheader("⚡ 快速通道")
+    
+    def on_hot_ticker_change():
+        # 当用户在侧边栏选择时，重置状态并触发分析
+        val = st.session_state.hot_ticker_selector
+        code = HOT_TICKERS_MAP.get(val)
+        if code:
+            st.session_state.process_status = "VERIFYING"
+            st.session_state.ticker = None # Let Verifier logic handle it
+            st.session_state.market_data = None
+            st.session_state.raw_news = {}
+            st.session_state.opinions = {}
+            st.session_state.retry_count = 0
+            st.session_state.user_query = code # Use the code as query
+            st.session_state.messages.append({"role": "user", "content": f"快速分析: {val}", "avatar": "⚡"})
+            # Rerun is automatic on callback completion usually, but we ensure it in main loop logic check
+
+    st.selectbox(
+        "选择热门标的 (支持搜索)",
+        options=list(HOT_TICKERS_MAP.keys()),
+        index=0,
+        key="hot_ticker_selector",
+        on_change=on_hot_ticker_change,
+        help="直接选择即可开始分析，无需输入代码。"
+    )
 
     st.divider()
     if st.button("🗑️ 清空历史 & 重置"):
@@ -204,17 +262,27 @@ def get_llm_client(api_key):
 def call_agent(agent_name, model_id, system_prompt, user_prompt, thinking_needed=False):
     client = get_llm_client(silicon_flow_key)
     
-    final_sys_prompt = system_prompt + """
-    \n【输出规范】
+    # Feature 3: Inject Current Time (解决时效性问题)
+    current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    final_sys_prompt = system_prompt + f"""
+    \n【重要环境信息】
+    当前系统时间: {current_time_str}
+    请根据此时间判断新闻的时效性。
+    
+    【输出规范】
     1. 语言：简体中文 (Simplified Chinese)。
     2. 格式：Markdown，禁止使用一级标题(#)，从三级(###)开始。
     3. 风格：专业、客观、金融研报风。
+    4. **严禁重复**：绝对禁止重复输出相同的句子或段落。如果发现自己正在重复，请立即停止并总结。
     """
     
     if thinking_needed:
         final_sys_prompt += "\nIMPORTANT: First output thinking process in <thinking>...</thinking>, then final answer."
 
     try:
+        # Feature 2: Fix Repetition (解决复读机问题)
+        # 增加 frequency_penalty 和 presence_penalty
         response = client.chat.completions.create(
             model=model_id,
             messages=[
@@ -222,7 +290,9 @@ def call_agent(agent_name, model_id, system_prompt, user_prompt, thinking_needed
                 {"role": "user", "content": user_prompt}
             ],
             temperature=0.3,
-            max_tokens=2048
+            max_tokens=2048,
+            frequency_penalty=0.6, # 抑制重复词频
+            presence_penalty=0.6   # 抑制重复话题
         )
         content = response.choices[0].message.content
         
@@ -256,8 +326,11 @@ for msg in st.session_state.messages:
             with st.expander("🧠 思考过程", expanded=False):
                 st.markdown(f"_{msg['thinking']}_")
 
-# 2. Input
-if user_input := st.chat_input("请输入股票名称或代码..."):
+# 2. Input Handling (Support both Chat Input and Quick Select)
+user_input = st.chat_input("请输入股票名称或代码 (或在左侧选择热门标的)...")
+
+if user_input:
+    # 检查 Keys 是否存在
     if not (silicon_flow_key and tavily_key):
         st.error("配置错误：缺少必要的 API Key")
         st.stop()
@@ -284,20 +357,26 @@ if st.session_state.process_status == "VERIFYING":
         st.write("🔍 董秘正在核实标的与属性...")
         
         with concurrent.futures.ThreadPoolExecutor() as executor:
-            f_en = executor.submit(search_web, f"{st.session_state.user_query} stock ticker Yahoo Finance", "general", tavily_key)
-            f_cn = executor.submit(search_web, f"{st.session_state.user_query} 股票代码 类型", "general", tavily_key)
+            f_en = executor.submit(search_web, f"{st.session_state.user_query} ticker symbol Yahoo Finance index", "general", tavily_key)
+            f_cn = executor.submit(search_web, f"{st.session_state.user_query} 股票代码 指数代码", "general", tavily_key)
             search_res = f_en.result() + f_cn.result()
             
         search_ctx = "\n".join(search_res)
         
+        # Router Prompt
         router_prompt = f"""
         User Query: "{st.session_state.user_query}"
         Search Results: {search_ctx}
         
         Task: Extract Ticker and Identify Asset Type.
+        
         Rules:
-        1. Ticker Format: A-Share (6 digits.SS/SZ), HK (4 digits.HK), US (Symbol).
-        2. Asset Type: Identify if it is a single 'EQUITY' (stock), an 'INDEX' (like S&P 500, Hang Seng), or a 'FUND' (ETF, Mutual Fund).
+        1. Ticker Format: 
+           - A-Share: 6 digits + .SS/.SZ
+           - HK: 4 digits + .HK
+           - US: Symbol
+           - Index: Often starts with '^' (e.g. ^HSTECH, ^HSI, ^GSPC).
+        2. Asset Type: Identify if it is 'EQUITY' (stock), 'INDEX' (Market Index), or 'FUND' (ETF/Mutual Fund).
         3. Return JSON: {{'ticker': '...', 'company_name': '...', 'asset_type': 'EQUITY'|'INDEX'|'FUND'}}
         """
         
@@ -381,11 +460,9 @@ if st.session_state.process_status == "ANALYZING" and st.session_state.ticker:
                     "micro": f"{ticker} stock news financial reports analysis",
                 }
             else:
-                # Modified queries for Index/Fund
                 queries = {
                     "macro": f"global macro economy affecting {mkt.get('name', '')}",
                     "meso": f"{ticker} sector allocation industry breakdown",
-                    # Micro focuses on holdings
                     "micro": f"news and performance of key holdings: {st.session_state.top_holdings} analysis",
                 }
             
