@@ -20,7 +20,7 @@ ALPHA_VANTAGE_KEY = "8G1QKAWN221XEZR8"
 
 # --- PAGE SETUP ---
 st.set_page_config(
-    page_title="MAS 联合研报终端 v3.2",
+    page_title="MAS 联合研报终端 v3.3",
     page_icon="🏦",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -58,6 +58,8 @@ if "raw_news" not in st.session_state:
     st.session_state.raw_news = {}
 if "retry_count" not in st.session_state:
     st.session_state.retry_count = 0
+if "last_rework_field" not in st.session_state:
+    st.session_state.last_rework_field = None
 
 # --- SIDEBAR ---
 with st.sidebar:
@@ -115,13 +117,13 @@ def calculate_technical_indicators(df):
     df['RSI'] = 100 - (100 / (1 + rs))
     return df
 
-# 增加 Alpha Vantage 作为备用数据源
-def fetch_alpha_vantage_data(ticker):
-    url = f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol={ticker}&apikey={ALPHA_VANTAGE_KEY}&outputsize=compact"
+# 单独的 Alpha Vantage 获取函数
+def fetch_from_alphavantage(ticker):
     try:
-        r = requests.get(url)
+        url = f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol={ticker}&apikey={ALPHA_VANTAGE_KEY}&outputsize=compact"
+        r = requests.get(url, timeout=10)
         data = r.json()
-        if "Time Series (Daily)" not in data: raise ValueError("AV No Data")
+        if "Time Series (Daily)" not in data: return None
         
         df = pd.DataFrame.from_dict(data["Time Series (Daily)"], orient='index')
         df = df.rename(columns={"4. close": "Close", "1. open": "Open", "2. high": "High", "3. low": "Low"})
@@ -133,22 +135,22 @@ def fetch_alpha_vantage_data(ticker):
             "symbol": ticker.upper(),
             "name": ticker,
             "price": df['Close'].iloc[-1],
-            "change_pct": 0.0, # AV Daily 不提供实时涨跌
+            "change_pct": 0.0,
             "pe": "N/A",
             "cap": "N/A",
             "history_df": df,
             "last_macd": {"hist": df['MACD_Hist'].iloc[-1]},
             "last_rsi": df['RSI'].iloc[-1]
         }
-    except Exception as e:
-        raise e
+    except:
+        return None
 
-def fetch_market_data(ticker):
-    # 优先尝试 yfinance
+# 单独的 YFinance 获取函数
+def fetch_from_yfinance(ticker):
     try:
         stock = yf.Ticker(ticker)
         hist = stock.history(period="6mo")
-        if hist.empty: raise ValueError("YF Empty Data")
+        if hist.empty: return None
         hist = calculate_technical_indicators(hist)
         info = stock.info
         return {
@@ -164,11 +166,23 @@ def fetch_market_data(ticker):
             "last_rsi": hist['RSI'].iloc[-1]
         }
     except:
-        # 失败则尝试 Alpha Vantage
-        try:
-            return fetch_alpha_vantage_data(ticker)
-        except:
-            return {"status": "OFFLINE", "error": "Market data unavailable from both YF and AV"}
+        return None
+
+def fetch_market_data(ticker):
+    # 并行请求两个数据源
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        future_yf = executor.submit(fetch_from_yfinance, ticker)
+        future_av = executor.submit(fetch_from_alphavantage, ticker)
+        
+        # 优先等待 YF
+        yf_data = future_yf.result()
+        if yf_data: return yf_data
+        
+        # 如果 YF 失败，使用 AV
+        av_data = future_av.result()
+        if av_data: return av_data
+        
+    return {"status": "OFFLINE", "error": "Market data unavailable from both YF and AV"}
 
 def search_web(query, topic="general"):
     try:
@@ -219,7 +233,7 @@ SPECIFIC_MODELS = {
 
 # --- MAIN UI LOGIC ---
 
-st.title("🏦 MAS 联合研报终端 v3.2")
+st.title("🏦 MAS 联合研报终端 v3.3")
 st.caption(f"混合模型引擎: Qwen (路由) | MiniMax (情报) | DeepSeek (分析) | Kimi (首席研究)")
 
 # 1. Chat History Rendering
@@ -241,6 +255,7 @@ if user_input := st.chat_input("请输入标的..."):
     st.session_state.raw_news = {}
     st.session_state.retry_count = 0
     st.session_state.final_report = None
+    st.session_state.last_rework_field = None
     
     st.session_state.messages.append({"role": "user", "content": user_input, "avatar": "👤"})
     with st.chat_message("user", avatar="👤"):
@@ -271,13 +286,13 @@ if st.session_state.process_status == "ANALYZING" and st.session_state.ticker:
     # --- STEP A: FETCH DATA ---
     if not st.session_state.market_data:
         with st.status("📡 正在进行全网情报搜集...", expanded=True) as status:
-            # Market Data (YFinance -> Alpha Vantage)
+            # Market Data (Concurrent)
             mkt = fetch_market_data(ticker)
+            st.session_state.market_data = mkt # Save even if offline to avoid loop
+            
             if mkt['status'] == "OFFLINE":
-                status.update(label="❌ 数据获取失败", state="error")
-                st.error(mkt.get('error'))
-                st.stop()
-            st.session_state.market_data = mkt
+                st.error("行情数据获取失败 (Yahoo & Alpha Vantage 均不可用)")
+                # We continue with news only, but warn user
             
             # Web Search (Tavily)
             queries = {
@@ -299,28 +314,62 @@ if st.session_state.process_status == "ANALYZING" and st.session_state.ticker:
     news = st.session_state.raw_news
     opinions = {}
     
-    st.subheader(f"🗣️ 投研会议 (Round {st.session_state.retry_count + 1})")
+    st.divider()
     
+    # 📈 行情看板 (如果数据可用)
+    if mkt and mkt['status'] != "OFFLINE":
+        st.markdown(f"### 📉 行情看板: {mkt.get('name', ticker)} ({mkt.get('symbol')})")
+        
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("价格", f"{mkt['price']:.2f}", f"{mkt['change_pct']:.2f}%")
+        c2.metric("PE (静)", mkt.get('pe', 'N/A'))
+        c3.metric("RSI", f"{mkt.get('last_rsi', 0):.1f}")
+        c4.metric("MACD柱", f"{mkt.get('last_macd', {}).get('hist', 0):.3f}")
+        
+        if 'history_df' in mkt:
+            fig = go.Figure(data=[go.Candlestick(x=mkt['history_df'].index,
+                            open=mkt['history_df']['Open'], high=mkt['history_df']['High'],
+                            low=mkt['history_df']['Low'], close=mkt['history_df']['Close'])])
+            fig.update_layout(height=350, template="plotly_white", margin=dict(l=0, r=0, t=10, b=0))
+            st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.warning("⚠️ 暂无实时行情K线 (交易所接口无响应)，仅进行基本面分析。")
+
+    st.subheader(f"🗣️ 投研会议 (第 {st.session_state.retry_count + 1} 轮)")
+    if st.session_state.retry_count > 0:
+        st.info(f"💡 本次会议包含了针对 **{st.session_state.last_rework_field}** 领域的补充情报。")
+    
+    # Agents Speak
     with st.chat_message("assistant", avatar="🌍"):
-        res, _ = call_agent("Macro", SPECIFIC_MODELS["MINIMAX"], "简述宏观环境。", str(news['macro']))
+        prompt = "简述宏观环境。"
+        if st.session_state.last_rework_field == "macro": prompt += " (请重点结合最新补充的宏观情报)"
+        res, _ = call_agent("Macro", SPECIFIC_MODELS["MINIMAX"], "你是宏观分析师。", f"{prompt}\n情报:{str(news['macro'])}")
         st.markdown(f"**宏观**: {res}")
         opinions['macro'] = res
 
     with st.chat_message("assistant", avatar="🏭"):
-        res, _ = call_agent("Meso", SPECIFIC_MODELS["MINIMAX"], f"分析 {ticker} 行业。", str(news['meso']))
+        prompt = f"分析 {ticker} 行业。"
+        if st.session_state.last_rework_field == "meso": prompt += " (请重点结合最新补充的行业情报)"
+        res, _ = call_agent("Meso", SPECIFIC_MODELS["MINIMAX"], f"你是行业分析师。", f"{prompt}\n情报:{str(news['meso'])}")
         st.markdown(f"**行业**: {res}")
         opinions['meso'] = res
 
     with st.chat_message("assistant", avatar="🔍"):
-        res, _ = call_agent("Micro", SPECIFIC_MODELS["MINIMAX"], f"分析 {ticker} 个股。", str(news['micro']))
+        prompt = f"分析 {ticker} 个股。"
+        if st.session_state.last_rework_field == "micro": prompt += " (请重点结合最新补充的个股情报)"
+        res, _ = call_agent("Micro", SPECIFIC_MODELS["MINIMAX"], f"你是公司研究员。", f"{prompt}\n情报:{str(news['micro'])}")
         st.markdown(f"**个股**: {res}")
         opinions['micro'] = res
     
-    with st.chat_message("assistant", avatar="💹"):
-        quant_ctx = f"Price:{mkt['price']}, PE:{mkt['pe']}, RSI:{mkt['last_rsi']:.1f}"
-        res, _ = call_agent("Finance", SPECIFIC_MODELS["DEEPSEEK"], "评价估值与技术面。", quant_ctx)
-        st.markdown(f"**量化**: {res}")
-        opinions['quant'] = res
+    # Quant only if market data exists
+    if mkt and mkt['status'] != "OFFLINE":
+        with st.chat_message("assistant", avatar="💹"):
+            quant_ctx = f"Price:{mkt['price']}, PE:{mkt['pe']}, RSI:{mkt.get('last_rsi')}"
+            res, _ = call_agent("Finance", SPECIFIC_MODELS["DEEPSEEK"], "评价估值与技术面。", quant_ctx)
+            st.markdown(f"**量化**: {res}")
+            opinions['quant'] = res
+    else:
+        quant_ctx = "Market Data Offline"
 
     # --- STEP C: DRAFTING ---
     with st.chat_message("assistant", avatar="📝"):
@@ -349,11 +398,17 @@ if st.session_state.process_status == "ANALYZING" and st.session_state.ticker:
         if "REWORK:" in review_res and st.session_state.retry_count < 1:
             match = re.search(r"REWORK:\s*(\w+)", review_res)
             field = match.group(1).lower() if match else "micro"
-            if field not in st.session_state.raw_news: field = "micro"
+            # Map random fields to known keys
+            if field not in ["macro", "meso", "micro"]: field = "micro"
             
+            st.session_state.last_rework_field = field
             st.warning(f"🚨 驳回：要求补充 **{field}** 领域信息。正在执行...")
-            new_query = f"{ticker} {field} deep analysis recent news"
+            
+            # Supplement Search
+            new_query = f"{ticker} {field} analysis latest news details"
             new_info = search_web(new_query, "general")
+            
+            # Append new info specifically
             st.session_state.raw_news[field].extend(new_info)
             st.session_state.retry_count += 1
             st.rerun()
