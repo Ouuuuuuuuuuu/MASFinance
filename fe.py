@@ -344,8 +344,10 @@ if st.session_state.process_status == "ANALYZING" and st.session_state.ticker:
             mkt = fetch_market_data(ticker, alpha_vantage_key)
             st.session_state.market_data = mkt
             
-            if mkt['status'] == "OFFLINE":
-                st.error("行情数据获取失败")
+            if mkt and "ONLINE" in mkt.get('status', ''):
+                pass
+            else:
+                st.warning(f"行情数据获取受限: {mkt.get('error', 'Unknown Error')}")
             
             queries = {
                 "macro": "global macro economy news market trends",
@@ -362,14 +364,20 @@ if st.session_state.process_status == "ANALYZING" and st.session_state.ticker:
 
     # --- RENDER DASHBOARD ---
     mkt = st.session_state.market_data
-    if mkt and mkt['status'] != "OFFLINE":
+    # 修复：严格检查 status 是否包含 ONLINE，防止 ERROR 状态导致的 KeyError
+    if mkt and "ONLINE" in mkt.get('status', ''):
         with st.container():
             st.markdown(f"### 📉 {mkt.get('name')} ({mkt.get('symbol')})")
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric("价格", f"{mkt['price']:.2f}", f"{mkt['change_pct']:.2f}%")
-            c2.metric("PE", mkt.get('pe'))
-            c3.metric("RSI (14)", f"{mkt.get('last_rsi', 0):.1f}")
-            c4.metric("MACD", f"{mkt.get('last_macd', 0):.3f}")
+            try:
+                c1.metric("价格", f"{mkt['price']:.2f}", f"{mkt['change_pct']:.2f}%")
+                c2.metric("PE", mkt.get('pe', 'N/A'))
+                c3.metric("RSI (14)", f"{mkt.get('last_rsi', 0):.1f}")
+                c4.metric("MACD", f"{mkt.get('last_macd', 0):.3f}")
+            except Exception as e:
+                st.error(f"渲染看板出错: {str(e)}")
+    else:
+        st.warning(f"⚠️ 实时行情暂不可用 ({mkt.get('error', 'API Limitation')})，将仅进行定性分析。")
     
     st.divider()
     
@@ -426,7 +434,7 @@ if st.session_state.process_status == "ANALYZING" and st.session_state.ticker:
     render_opinion("Company", "🔍", "micro", SPECIFIC_MODELS["MICRO"], f"分析 {ticker} 个股基本面。")
     
     # Quant (Always run if market data exists, quick check)
-    if mkt and mkt['status'] != "OFFLINE":
+    if mkt and "ONLINE" in mkt.get('status', ''):
         with st.chat_message("assistant", avatar="💹"):
             q_ctx = f"Price:{mkt['price']}, RSI:{mkt.get('last_rsi')}, MACD:{mkt.get('last_macd')}"
             res, _ = call_agent("Quant", SPECIFIC_MODELS["QUANT"], "技术面分析师", f"基于数据评价趋势：{q_ctx}")
