@@ -19,7 +19,7 @@ ALPHA_VANTAGE_KEY = "8G1QKAWN221XEZR8"
 
 # --- PAGE SETUP ---
 st.set_page_config(
-    page_title="MAS 联合研报终端 v3.4",
+    page_title="MAS 联合研报终端 v3.5",
     page_icon="🏦",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -225,7 +225,7 @@ SPECIFIC_MODELS = {
 
 # --- MAIN UI LOGIC ---
 
-st.title("🏦 MAS 联合研报终端 v3.4 (Search Augmented)")
+st.title("🏦 MAS 联合研报终端 v3.5 (Verification Fixed)")
 st.caption(f"混合模型引擎: Qwen (路由) | MiniMax (情报) | DeepSeek (分析) | Kimi (首席研究)")
 
 # 1. Chat History Rendering
@@ -253,40 +253,81 @@ if user_input := st.chat_input("请输入标的..."):
     with st.chat_message("user", avatar="👤"):
         st.markdown(user_input)
 
-    # --- STEP 1: SMART ROUTER (Updated) ---
+    # --- STEP 1: SMART ROUTER (Verification Added) ---
     with st.chat_message("assistant", avatar="👩‍💼"):
-        st.write("🔍 董秘正在全网核实股票代码...")
+        st.write("🔍 董秘正在核实代码...")
         
-        # 1. Use Tavily to find the ticker first (Search Augmentation)
-        search_res = search_web(f"{user_input} Yahoo Finance stock ticker code", "general")
+        # 1. Double Search (English + Chinese)
+        # English search is good for tickers, Chinese search ensures we get A-share context
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            f_en = executor.submit(search_web, f"{user_input} stock ticker Yahoo Finance", "general")
+            f_cn = executor.submit(search_web, f"{user_input} 股票代码", "general")
+            search_res = f_en.result() + f_cn.result()
+        
         search_context = "\n".join(search_res)
         
-        # 2. Ask LLM to extract
+        # 2. Extract
         router_prompt = f"""
         用户想要分析: "{user_input}"
         
-        网络搜索结果:
+        搜索结果:
         {search_context}
         
-        请根据搜索结果，提取最准确的 Yahoo Finance Ticker。
-        - A股: 60xxxx.SS, 00xxxx.SZ, 30xxxx.SZ (如易点天下: 301171.SZ)
-        - 港股: xxxx.HK
-        - 美股: 字母代码 (如 NVDA)
+        请提取Yahoo Finance Ticker。
+        规则：
+        1. A股必须是 6 位数字 + .SS (上海) 或 .SZ (深圳)。例如 301171 -> 301171.SZ
+        2. 港股是 4 位数字 + .HK
+        3. 美股是字母
+        4. 务必区分“易点天下(301171)”和“中科润宇(301175)”等相似代码，依靠搜索结果中的公司名匹配。
         
-        严格只返回JSON: {{'ticker': '...'}}
+        返回JSON: {{'ticker': '...', 'company_name_in_search': '...'}}
         """
         
-        res, _ = call_agent("Router", SPECIFIC_MODELS["QWEN"], "你是董秘。", router_prompt)
-        
+        res, _ = call_agent("Router", SPECIFIC_MODELS["QWEN"], "你是董秘。精确提取代码。", router_prompt)
         json_data = extract_json_from_markdown(res)
         
         if json_data and 'ticker' in json_data:
-            st.session_state.ticker = json_data['ticker']
-            st.markdown(f"✅ 标的确认：**{st.session_state.ticker}**")
-            st.session_state.process_status = "ANALYZING"
-            st.rerun()
+            ticker_candidate = json_data['ticker']
+            
+            # 3. IDENTITY VERIFICATION (New Step)
+            # Fetch real name from YFinance to double check
+            try:
+                real_info = yf.Ticker(ticker_candidate).info
+                real_name = real_info.get('longName', '') or real_info.get('shortName', '')
+                
+                if real_name:
+                    # Let Qwen confirm if "real_name" matches "user_input"
+                    verify_prompt = f"""
+                    用户输入: "{user_input}"
+                    提取代码: "{ticker_candidate}"
+                    该代码对应的官方名称: "{real_name}"
+                    
+                    请判断官方名称是否与用户输入匹配？
+                    如果匹配，返回 "YES"。
+                    如果不匹配（例如用户搜易点天下，但代码对应中科润宇），返回 "NO"。
+                    """
+                    verify_res, _ = call_agent("Verifier", SPECIFIC_MODELS["QWEN"], "你是审核员。", verify_prompt)
+                    
+                    if "NO" in verify_res:
+                        st.error(f"⚠️ 警告：代码 {ticker_candidate} 对应公司为 **{real_name}**，似乎与您的输入不符。请尝试输入更准确的全名。")
+                        st.stop()
+                    else:
+                        st.session_state.ticker = ticker_candidate
+                        st.markdown(f"✅ 身份核验通过：**{real_name} ({ticker_candidate})**")
+                        st.session_state.process_status = "ANALYZING"
+                        st.rerun()
+                else:
+                    # Fallback if YF fails to get name (e.g. network issue), trust LLM but warn
+                    st.warning(f"⚠️ 无法从交易所验证代码 {ticker_candidate}，将尝试强行分析...")
+                    st.session_state.ticker = ticker_candidate
+                    st.session_state.process_status = "ANALYZING"
+                    st.rerun()
+            except Exception as e:
+                st.error(f"代码验证失败: {str(e)}")
+                st.stop()
+                
         else:
-            st.error(f"无法识别标的，搜索结果: {search_context}")
+            st.error("无法识别有效代码")
             st.stop()
 
 # 3. Analysis Process
