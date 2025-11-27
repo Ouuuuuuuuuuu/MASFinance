@@ -13,7 +13,7 @@ import requests
 
 # --- PAGE SETUP ---
 st.set_page_config(
-    page_title="MAS 联合研报终端 v4.1",
+    page_title="MAS 联合研报终端 v4.2",
     page_icon="🏦",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -40,7 +40,6 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # --- CONFIGURATION & SECRETS ---
-# 修改说明：直接从 st.secrets 读取所有 Keys，不再提供侧边栏输入
 try:
     SECRETS = st.secrets["api_keys"]
     silicon_flow_key = SECRETS["silicon_flow"]
@@ -95,7 +94,6 @@ init_state()
 # --- SIDEBAR ---
 with st.sidebar:
     st.title("🎛️ 控制台")
-    # 移除了所有 Input，仅显示状态
     st.success("✅ API 密钥已加载")
     st.caption("Environment: Protected")
 
@@ -321,7 +319,6 @@ if st.session_state.process_status == "VERIFYING":
             else:
                 st.session_state.ticker = candidate
                 st.session_state.verification_fail = True
-                # 7. 优化提示语：您是不是想找...
                 st.warning(f"⚠️ 未完全匹配。您是不是想找：**{candidate_name} ({candidate})**？")
                 col1, col2 = st.columns(2)
                 if col1.button("✅ 是的，继续分析"):
@@ -364,7 +361,6 @@ if st.session_state.process_status == "ANALYZING" and st.session_state.ticker:
 
     # --- RENDER DASHBOARD ---
     mkt = st.session_state.market_data
-    # 修复：严格检查 status 是否包含 ONLINE，防止 ERROR 状态导致的 KeyError
     if mkt and "ONLINE" in mkt.get('status', ''):
         with st.container():
             st.markdown(f"### 📉 {mkt.get('name')} ({mkt.get('symbol')})")
@@ -384,26 +380,19 @@ if st.session_state.process_status == "ANALYZING" and st.session_state.ticker:
     # --- AGENT MEETING ---
     news = st.session_state.raw_news
     
-    # Helper to render or get cached opinion (实现了“续写不覆盖”逻辑)
+    # Helper to render or get cached opinion
     def render_opinion(role, avatar, key, model, prompt_tmpl):
         with st.chat_message("assistant", avatar=avatar):
             is_rework_target = st.session_state.last_rework_field == key
             existing_opinion = st.session_state.opinions.get(key, None)
             
-            # 逻辑：
-            # 1. 如果已有观点 且 不是当前需要返工的领域 -> 直接展示旧观点 (省钱 & 稳定)
-            # 2. 如果是返工领域 -> 传入旧观点，要求"续写/修正"
-            # 3. 如果是第一次 -> 初始生成
-            
             if existing_opinion and not is_rework_target:
                 st.markdown(f"**{role} (已归档)**: {existing_opinion}")
                 return existing_opinion
             
-            # 构造 Prompt
             current_news = str(news.get(key, ''))
             
             if is_rework_target and existing_opinion:
-                # 6. 返工内容继续写，不覆盖
                 final_prompt = f"""
                 {prompt_tmpl}
                 
@@ -422,18 +411,15 @@ if st.session_state.process_status == "ANALYZING" and st.session_state.ticker:
             res, _ = call_agent(role, model, f"你是{role}分析师。", final_prompt)
             st.markdown(f"**{role}**: {res}")
             
-            # Save to session state
             st.session_state.opinions[key] = res
             return res
 
     st.subheader(f"🗣️ 投研会议 (第 {st.session_state.retry_count + 1} 轮)")
     
-    # Render Agents
     render_opinion("Macro", "🌍", "macro", SPECIFIC_MODELS["MACRO"], "简述宏观环境。")
     render_opinion("Industry", "🏭", "meso", SPECIFIC_MODELS["MESO"], f"分析 {ticker} 行业竞争格局。")
     render_opinion("Company", "🔍", "micro", SPECIFIC_MODELS["MICRO"], f"分析 {ticker} 个股基本面。")
     
-    # Quant (Always run if market data exists, quick check)
     if mkt and "ONLINE" in mkt.get('status', ''):
         with st.chat_message("assistant", avatar="💹"):
             q_ctx = f"Price:{mkt['price']}, RSI:{mkt.get('last_rsi')}, MACD:{mkt.get('last_macd')}"
@@ -444,7 +430,6 @@ if st.session_state.process_status == "ANALYZING" and st.session_state.ticker:
     # --- DRAFTING ---
     with st.chat_message("assistant", avatar="📝"):
         st.write("✍️ 正在撰写草案...")
-        # Analyst uses all current opinions (some cached, some updated)
         draft_ctx = f"Opinions: {json.dumps(st.session_state.opinions, ensure_ascii=False)}"
         report_draft, _ = call_agent("Writer", SPECIFIC_MODELS["WRITER"], "首席分析师。整合研报。", draft_ctx)
         st.markdown(report_draft)
@@ -452,8 +437,22 @@ if st.session_state.process_status == "ANALYZING" and st.session_state.ticker:
     # --- CHIEF REVIEW ---
     with st.chat_message("assistant", avatar="👨‍🔬"):
         st.write("🕵️ 首席研究员审核中...")
-        review_prompt = f"研报草案:\n{report_draft}\n\n指令：若信息不足，输出 REWORK: [MACRO/MESO/MICRO]。否则输出最终结论。"
-        review_res, thinking = call_agent("Chief", SPECIFIC_MODELS["CHIEF"], "首席研究员。严格审核。", review_prompt, thinking_needed=True)
+        
+        # ⚠️ 修改：大幅降低首席审核门槛，禁止提出过分要求
+        review_prompt = f"""
+        研报草案:
+        {report_draft}
+        
+        任务：作为首席研究员，请评估是否需要简单的补充搜索。
+        1. 只有在**核心信息缺失**导致无法得出结论时，才要求返工。
+        2. 如果需要返工，仅输出指令：REWORK: [MACRO/MESO/MICRO] (选择一个最需要补充的领域)。
+           - **不要**列出过于苛刻的数据要求（如审计页码、内部模型参数）。
+           - **不要**长篇大论。简要说明即可。
+           - 记住：我们只能通过公开网络搜索来补充信息，不能获取内部数据。
+        3. 如果信息基本充足，请直接输出最终投资建议。
+        """
+        
+        review_res, thinking = call_agent("Chief", SPECIFIC_MODELS["CHIEF"], "首席研究员。务实审核。", review_prompt, thinking_needed=True)
         
         if thinking:
             with st.expander("🧠 首席思考过程", expanded=True):
@@ -467,14 +466,20 @@ if st.session_state.process_status == "ANALYZING" and st.session_state.ticker:
             field_map = {"macro": "macro", "industry": "meso", "meso": "meso", "company": "micro", "micro": "micro"}
             target_key = field_map.get(field, "micro")
             
-            st.warning(f"🚨 驳回：需补充 {target_key} 领域信息。正在执行...")
+            st.warning(f"🚨 补充情报：正在针对 {target_key} 进行定向搜索...")
+            st.markdown(f"_{review_res}_") # 仍然展示出来，但因为 prompt 限制了长度，应该不会太长
             
-            # 5. 智能补充搜索 (Agent 构造关键词)
-            st.write(f"🔍 正在针对 {target_key} 进行深度挖掘...")
-            keyword_prompt = f"针对股票 {ticker}，目前 {target_key} 领域信息缺失。请生成3个具体的Google搜索关键词用于挖掘该领域的深层信息。只返回关键词，用空格分隔。"
+            # Agent 构造关键词
+            keyword_prompt = f"""
+            针对股票 {ticker}，首席研究员认为 {target_key} 领域信息缺失。
+            请生成3个具体的搜索关键词。
+            要求：必须是能够在 Google/Bing 上直接搜到的公开信息关键词，不要涉及需要权限的数据库。
+            只返回关键词，用空格分隔。
+            """
             keywords, _ = call_agent("Searcher", SPECIFIC_MODELS["VERIFIER"], "Search Expert", keyword_prompt)
             
             new_query = f"{ticker} {keywords}"
+            st.caption(f"🔍 执行搜索: {new_query}")
             new_info = search_web(new_query, "general", tavily_key)
             
             if target_key in st.session_state.raw_news:
