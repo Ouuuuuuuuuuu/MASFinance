@@ -13,7 +13,7 @@ import requests
 
 # --- PAGE SETUP ---
 st.set_page_config(
-    page_title="MAS 联合研报终端 v4.2",
+    page_title="MAS 联合研报终端 v4.3",
     page_icon="🏦",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -77,6 +77,8 @@ def init_state():
         "messages": [{"role": "assistant", "content": "首席研究员就位。请下达调研指令。", "avatar": "👨‍🔬"}],
         "process_status": "IDLE", # IDLE, VERIFYING, ANALYZING, DONE
         "ticker": None,
+        "asset_type": "EQUITY", # EQUITY, INDEX, FUND
+        "top_holdings": [], # List of strings
         "market_data": None,
         "raw_news": {},     # {field: [news1, news2]}
         "opinions": {},     # {field: "analysis text"} -> 用于实现续写不覆盖
@@ -160,10 +162,17 @@ def fetch_market_data(ticker, av_key):
     hist = calculate_technical_indicators(hist)
     
     try:
-        last_close = hist['Close'].iloc[-1]
-        prev_close = hist['Close'].iloc[-2]
-        change_pct = ((last_close - prev_close) / prev_close) * 100
+        if len(hist) < 2:
+            last_close = hist['Close'].iloc[-1]
+            change_pct = 0.0
+        else:
+            last_close = hist['Close'].iloc[-1]
+            prev_close = hist['Close'].iloc[-2]
+            change_pct = ((last_close - prev_close) / prev_close) * 100
         
+        last_macd = hist['MACD_Hist'].iloc[-1] if 'MACD_Hist' in hist and not pd.isna(hist['MACD_Hist'].iloc[-1]) else 0
+        last_rsi = hist['RSI'].iloc[-1] if 'RSI' in hist and not pd.isna(hist['RSI'].iloc[-1]) else 50
+
         return {
             "status": f"ONLINE ({source})",
             "symbol": ticker.upper(),
@@ -173,8 +182,8 @@ def fetch_market_data(ticker, av_key):
             "pe": info.get('trailingPE', 'N/A') if info else 'N/A',
             "cap": info.get('marketCap', 'N/A') if info else 'N/A',
             "history_df": hist,
-            "last_macd": hist['MACD_Hist'].iloc[-1],
-            "last_rsi": hist['RSI'].iloc[-1]
+            "last_macd": last_macd,
+            "last_rsi": last_rsi
         }
     except Exception as e:
         return {"status": "ERROR", "error": str(e)}
@@ -249,7 +258,6 @@ for msg in st.session_state.messages:
 
 # 2. Input
 if user_input := st.chat_input("请输入股票名称或代码..."):
-    # 检查 Keys 是否存在
     if not (silicon_flow_key and tavily_key):
         st.error("配置错误：缺少必要的 API Key")
         st.stop()
@@ -257,9 +265,11 @@ if user_input := st.chat_input("请输入股票名称或代码..."):
     # Reset State for new query
     st.session_state.process_status = "VERIFYING"
     st.session_state.ticker = None
+    st.session_state.asset_type = "EQUITY"
+    st.session_state.top_holdings = []
     st.session_state.market_data = None
     st.session_state.raw_news = {}
-    st.session_state.opinions = {} # Clear opinions for new stock
+    st.session_state.opinions = {} 
     st.session_state.retry_count = 0
     st.session_state.last_rework_field = None
     st.session_state.verification_fail = False
@@ -271,11 +281,11 @@ if user_input := st.chat_input("请输入股票名称或代码..."):
 # 3. VERIFICATION PHASE
 if st.session_state.process_status == "VERIFYING":
     with st.chat_message("assistant", avatar="👩‍💼"):
-        st.write("🔍 董秘正在核实代码...")
+        st.write("🔍 董秘正在核实标的与属性...")
         
         with concurrent.futures.ThreadPoolExecutor() as executor:
             f_en = executor.submit(search_web, f"{st.session_state.user_query} stock ticker Yahoo Finance", "general", tavily_key)
-            f_cn = executor.submit(search_web, f"{st.session_state.user_query} 股票代码", "general", tavily_key)
+            f_cn = executor.submit(search_web, f"{st.session_state.user_query} 股票代码 类型", "general", tavily_key)
             search_res = f_en.result() + f_cn.result()
             
         search_ctx = "\n".join(search_res)
@@ -284,36 +294,37 @@ if st.session_state.process_status == "VERIFYING":
         User Query: "{st.session_state.user_query}"
         Search Results: {search_ctx}
         
-        Task: Extract the Yahoo Finance Ticker.
+        Task: Extract Ticker and Identify Asset Type.
         Rules:
-        1. A-Share: 6 digits + .SS or .SZ (e.g., 600519.SS)
-        2. HK Share: 4 digits + .HK
-        3. US Share: Ticker symbol (e.g., TSLA)
-        4. Return JSON: {{'ticker': '...', 'company_name': '...'}}
+        1. Ticker Format: A-Share (6 digits.SS/SZ), HK (4 digits.HK), US (Symbol).
+        2. Asset Type: Identify if it is a single 'EQUITY' (stock), an 'INDEX' (like S&P 500, Hang Seng), or a 'FUND' (ETF, Mutual Fund).
+        3. Return JSON: {{'ticker': '...', 'company_name': '...', 'asset_type': 'EQUITY'|'INDEX'|'FUND'}}
         """
         
-        res, _ = call_agent("Router", SPECIFIC_MODELS["ROUTER"], "Extract Ticker JSON.", router_prompt)
+        res, _ = call_agent("Router", SPECIFIC_MODELS["ROUTER"], "Extract Info JSON.", router_prompt)
         json_data = extract_json_from_markdown(res)
         
         if json_data and 'ticker' in json_data:
             candidate = json_data['ticker']
             candidate_name = json_data.get('company_name', 'Unknown')
+            asset_type = json_data.get('asset_type', 'EQUITY')
             
             verify_prompt = f"""
             User Input: "{st.session_state.user_query}"
-            Extracted Ticker: "{candidate}"
-            Extracted Name: "{candidate_name}"
+            Extracted: {candidate} ({candidate_name})
+            Type: {asset_type}
             
-            Does this ticker likely match the user's intent?
-            Return JSON: {{'match': true/false, 'reason': '...'}}
+            Is this correct? Return JSON: {{'match': true/false}}
             """
-            v_res, _ = call_agent("Verifier", SPECIFIC_MODELS["VERIFIER"], "Verify intent JSON.", verify_prompt)
+            v_res, _ = call_agent("Verifier", SPECIFIC_MODELS["VERIFIER"], "Verify intent.", verify_prompt)
             v_json = extract_json_from_markdown(v_res)
             
             if v_json and v_json.get('match'):
                 st.session_state.ticker = candidate
+                st.session_state.asset_type = asset_type
                 st.session_state.process_status = "ANALYZING"
-                st.success(f"✅ 锁定标的: {candidate_name} ({candidate})")
+                type_label = {"EQUITY": "个股", "INDEX": "指数", "FUND": "基金"}.get(asset_type, "标的")
+                st.success(f"✅ 锁定{type_label}: {candidate_name} ({candidate})")
                 time.sleep(1)
                 st.rerun()
             else:
@@ -334,10 +345,12 @@ if st.session_state.process_status == "VERIFYING":
 # 4. ANALYSIS PHASE
 if st.session_state.process_status == "ANALYZING" and st.session_state.ticker:
     ticker = st.session_state.ticker
+    asset_type = st.session_state.asset_type
     
     # --- FETCH DATA ---
     if not st.session_state.market_data:
         with st.status("📡 正在获取行情与情报...", expanded=True) as status:
+            # 1. Market Data
             mkt = fetch_market_data(ticker, alpha_vantage_key)
             st.session_state.market_data = mkt
             
@@ -346,11 +359,35 @@ if st.session_state.process_status == "ANALYZING" and st.session_state.ticker:
             else:
                 st.warning(f"行情数据获取受限: {mkt.get('error', 'Unknown Error')}")
             
-            queries = {
-                "macro": "global macro economy news market trends",
-                "meso": f"{ticker} industry competitors market share",
-                "micro": f"{ticker} stock news financial reports analysis",
-            }
+            # 2. Holdings Drill-down (For Index/Fund)
+            holdings_info = ""
+            if asset_type in ["INDEX", "FUND"] and not st.session_state.top_holdings:
+                st.write("🔎 识别为指数/基金，正在穿透查找重仓股...")
+                h_query = f"{ticker} {mkt.get('name', '')} top 10 holdings heavy weight stocks"
+                h_res = search_web(h_query, "general", tavily_key)
+                
+                # Use Agent to extract holdings list
+                h_prompt = f"From search results, extract top 5 holdings/constituents of {ticker}. Return comma separated string."
+                h_extract, _ = call_agent("Analyst", SPECIFIC_MODELS["VERIFIER"], "Extract holdings.", f"{str(h_res)}\n{h_prompt}")
+                st.session_state.top_holdings = h_extract
+                holdings_info = f"Top Holdings: {h_extract}"
+                st.caption(f"🎯 核心成分股: {h_extract}")
+
+            # 3. Build Queries
+            if asset_type == "EQUITY":
+                queries = {
+                    "macro": "global macro economy news market trends",
+                    "meso": f"{ticker} industry competitors market share",
+                    "micro": f"{ticker} stock news financial reports analysis",
+                }
+            else:
+                # Modified queries for Index/Fund
+                queries = {
+                    "macro": f"global macro economy affecting {mkt.get('name', '')}",
+                    "meso": f"{ticker} sector allocation industry breakdown",
+                    # Micro focuses on holdings
+                    "micro": f"news and performance of key holdings: {st.session_state.top_holdings} analysis",
+                }
             
             with concurrent.futures.ThreadPoolExecutor() as executor:
                 futures = {k: executor.submit(search_web, v, "news", tavily_key) for k, v in queries.items()}
@@ -363,7 +400,7 @@ if st.session_state.process_status == "ANALYZING" and st.session_state.ticker:
     mkt = st.session_state.market_data
     if mkt and "ONLINE" in mkt.get('status', ''):
         with st.container():
-            st.markdown(f"### 📉 {mkt.get('name')} ({mkt.get('symbol')})")
+            st.markdown(f"### 📉 {mkt.get('name')} ({mkt.get('symbol')}) - {asset_type}")
             c1, c2, c3, c4 = st.columns(4)
             try:
                 c1.metric("价格", f"{mkt['price']:.2f}", f"{mkt['change_pct']:.2f}%")
@@ -380,7 +417,6 @@ if st.session_state.process_status == "ANALYZING" and st.session_state.ticker:
     # --- AGENT MEETING ---
     news = st.session_state.raw_news
     
-    # Helper to render or get cached opinion
     def render_opinion(role, avatar, key, model, prompt_tmpl):
         with st.chat_message("assistant", avatar=avatar):
             is_rework_target = st.session_state.last_rework_field == key
@@ -395,30 +431,32 @@ if st.session_state.process_status == "ANALYZING" and st.session_state.ticker:
             if is_rework_target and existing_opinion:
                 final_prompt = f"""
                 {prompt_tmpl}
-                
-                【重要】这是你之前的分析：
-                "{existing_opinion}"
-                
-                这是新补充的情报：
-                {current_news}
-                
-                请基于新情报对之前的分析进行**补充和修订**。不要完全推翻，保留有价值的旧观点，将新发现整合进去。
+                【重要】旧分析："{existing_opinion}"
+                新情报：{current_news}
+                请基于新情报对分析进行修订。
                 """
-                st.info("🔄 正在基于新情报修订观点...")
+                st.info("🔄 正在修订观点...")
             else:
                 final_prompt = f"{prompt_tmpl}\n情报:{current_news}"
 
             res, _ = call_agent(role, model, f"你是{role}分析师。", final_prompt)
             st.markdown(f"**{role}**: {res}")
-            
             st.session_state.opinions[key] = res
             return res
 
     st.subheader(f"🗣️ 投研会议 (第 {st.session_state.retry_count + 1} 轮)")
     
-    render_opinion("Macro", "🌍", "macro", SPECIFIC_MODELS["MACRO"], "简述宏观环境。")
-    render_opinion("Industry", "🏭", "meso", SPECIFIC_MODELS["MESO"], f"分析 {ticker} 行业竞争格局。")
-    render_opinion("Company", "🔍", "micro", SPECIFIC_MODELS["MICRO"], f"分析 {ticker} 个股基本面。")
+    # Dynamic Prompts based on Asset Type
+    if asset_type == "EQUITY":
+        render_opinion("Macro", "🌍", "macro", SPECIFIC_MODELS["MACRO"], "简述宏观环境。")
+        render_opinion("Industry", "🏭", "meso", SPECIFIC_MODELS["MESO"], f"分析 {ticker} 行业竞争格局。")
+        render_opinion("Company", "🔍", "micro", SPECIFIC_MODELS["MICRO"], f"分析 {ticker} 个股基本面。")
+    else:
+        # Index/Fund Analysis Strategy
+        holdings_str = str(st.session_state.top_holdings)
+        render_opinion("Macro", "🌍", "macro", SPECIFIC_MODELS["MACRO"], f"分析影响 {ticker} 指数/基金的宏观因素。")
+        render_opinion("Sector", "🏭", "meso", SPECIFIC_MODELS["MESO"], f"分析 {ticker} 的行业分布与板块轮动逻辑。")
+        render_opinion("Holdings", "🔍", "micro", SPECIFIC_MODELS["MICRO"], f"该标的为指数/基金。核心重仓股为：{holdings_str}。请重点分析这几家权重股的近期核心动态，从而推导指数走势。")
     
     if mkt and "ONLINE" in mkt.get('status', ''):
         with st.chat_message("assistant", avatar="💹"):
@@ -430,7 +468,7 @@ if st.session_state.process_status == "ANALYZING" and st.session_state.ticker:
     # --- DRAFTING ---
     with st.chat_message("assistant", avatar="📝"):
         st.write("✍️ 正在撰写草案...")
-        draft_ctx = f"Opinions: {json.dumps(st.session_state.opinions, ensure_ascii=False)}"
+        draft_ctx = f"Asset Type: {asset_type}\nOpinions: {json.dumps(st.session_state.opinions, ensure_ascii=False)}"
         report_draft, _ = call_agent("Writer", SPECIFIC_MODELS["WRITER"], "首席分析师。整合研报。", draft_ctx)
         st.markdown(report_draft)
 
@@ -438,21 +476,17 @@ if st.session_state.process_status == "ANALYZING" and st.session_state.ticker:
     with st.chat_message("assistant", avatar="👨‍🔬"):
         st.write("🕵️ 首席研究员审核中...")
         
-        # ⚠️ 修改：大幅降低首席审核门槛，禁止提出过分要求
         review_prompt = f"""
         研报草案:
         {report_draft}
         
-        任务：作为首席研究员，请评估是否需要简单的补充搜索。
-        1. 只有在**核心信息缺失**导致无法得出结论时，才要求返工。
-        2. 如果需要返工，仅输出指令：REWORK: [MACRO/MESO/MICRO] (选择一个最需要补充的领域)。
-           - **不要**列出过于苛刻的数据要求（如审计页码、内部模型参数）。
-           - **不要**长篇大论。简要说明即可。
-           - 记住：我们只能通过公开网络搜索来补充信息，不能获取内部数据。
-        3. 如果信息基本充足，请直接输出最终投资建议。
+        任务：务实审核。
+        1. 核心信息缺失导致无法结论时，才REWORK。
+        2. 指令：REWORK: [MACRO/MESO/MICRO]。
+        3. 否则输出结论。
         """
         
-        review_res, thinking = call_agent("Chief", SPECIFIC_MODELS["CHIEF"], "首席研究员。务实审核。", review_prompt, thinking_needed=True)
+        review_res, thinking = call_agent("Chief", SPECIFIC_MODELS["CHIEF"], "首席研究员。", review_prompt, thinking_needed=True)
         
         if thinking:
             with st.expander("🧠 首席思考过程", expanded=True):
@@ -463,19 +497,12 @@ if st.session_state.process_status == "ANALYZING" and st.session_state.ticker:
             match = re.search(r"REWORK:\s*(\w+)", review_res)
             field = match.group(1).lower() if match else "micro"
             
-            field_map = {"macro": "macro", "industry": "meso", "meso": "meso", "company": "micro", "micro": "micro"}
+            field_map = {"macro": "macro", "industry": "meso", "meso": "meso", "company": "micro", "micro": "micro", "holdings": "micro", "sector": "meso"}
             target_key = field_map.get(field, "micro")
             
             st.warning(f"🚨 补充情报：正在针对 {target_key} 进行定向搜索...")
-            st.markdown(f"_{review_res}_") # 仍然展示出来，但因为 prompt 限制了长度，应该不会太长
             
-            # Agent 构造关键词
-            keyword_prompt = f"""
-            针对股票 {ticker}，首席研究员认为 {target_key} 领域信息缺失。
-            请生成3个具体的搜索关键词。
-            要求：必须是能够在 Google/Bing 上直接搜到的公开信息关键词，不要涉及需要权限的数据库。
-            只返回关键词，用空格分隔。
-            """
+            keyword_prompt = f"针对 {ticker} ({asset_type}) 的 {target_key} 领域，生成3个公开搜索关键词。"
             keywords, _ = call_agent("Searcher", SPECIFIC_MODELS["VERIFIER"], "Search Expert", keyword_prompt)
             
             new_query = f"{ticker} {keywords}"
