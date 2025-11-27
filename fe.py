@@ -14,13 +14,12 @@ import feedparser
 import re
 
 # --- HARDCODED KEYS (Hidden from UI) ---
-# 预填好的 Key，不在界面显示
 TAVILY_API_KEY = "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"
 ALPHA_VANTAGE_KEY = "8G1QKAWN221XEZR8"
 
 # --- PAGE SETUP ---
 st.set_page_config(
-    page_title="MAS 联合研报终端 v3.3",
+    page_title="MAS 联合研报终端 v3.4",
     page_icon="🏦",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -47,7 +46,7 @@ st.markdown("""
 
 # --- SESSION STATE INITIALIZATION ---
 if "messages" not in st.session_state:
-    st.session_state.messages = [{"role": "assistant", "content": "首席研究员就位。请下达调研指令（如：分析 特斯拉）。", "avatar": "👨‍🔬"}]
+    st.session_state.messages = [{"role": "assistant", "content": "首席研究员就位。请下达调研指令（如：分析 易点天下）。", "avatar": "👨‍🔬"}]
 if "process_status" not in st.session_state:
     st.session_state.process_status = "IDLE"
 if "ticker" not in st.session_state:
@@ -66,7 +65,6 @@ with st.sidebar:
     st.title("🎛️ 控制台")
     st.subheader("🔑 鉴权设置")
     
-    # 只显示 SiliconFlow Key 输入框
     default_sf_key = st.secrets.get("SILICON_FLOW_KEY", "")
     silicon_flow_key = st.text_input("SiliconFlow Key", value=default_sf_key, type="password", help="请输入您的硅基流动 API Key")
 
@@ -100,7 +98,6 @@ def get_llm_client():
     return OpenAI(api_key=silicon_flow_key, base_url="https://api.siliconflow.cn/v1")
 
 def get_tavily_client():
-    # 直接使用硬编码的 Key
     return TavilyClient(api_key=TAVILY_API_KEY)
 
 def calculate_technical_indicators(df):
@@ -117,7 +114,6 @@ def calculate_technical_indicators(df):
     df['RSI'] = 100 - (100 / (1 + rs))
     return df
 
-# 单独的 Alpha Vantage 获取函数
 def fetch_from_alphavantage(ticker):
     try:
         url = f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol={ticker}&apikey={ALPHA_VANTAGE_KEY}&outputsize=compact"
@@ -145,7 +141,6 @@ def fetch_from_alphavantage(ticker):
     except:
         return None
 
-# 单独的 YFinance 获取函数
 def fetch_from_yfinance(ticker):
     try:
         stock = yf.Ticker(ticker)
@@ -169,16 +164,13 @@ def fetch_from_yfinance(ticker):
         return None
 
 def fetch_market_data(ticker):
-    # 并行请求两个数据源
     with concurrent.futures.ThreadPoolExecutor() as executor:
         future_yf = executor.submit(fetch_from_yfinance, ticker)
         future_av = executor.submit(fetch_from_alphavantage, ticker)
         
-        # 优先等待 YF
         yf_data = future_yf.result()
         if yf_data: return yf_data
         
-        # 如果 YF 失败，使用 AV
         av_data = future_av.result()
         if av_data: return av_data
         
@@ -233,7 +225,7 @@ SPECIFIC_MODELS = {
 
 # --- MAIN UI LOGIC ---
 
-st.title("🏦 MAS 联合研报终端 v3.3")
+st.title("🏦 MAS 联合研报终端 v3.4 (Search Augmented)")
 st.caption(f"混合模型引擎: Qwen (路由) | MiniMax (情报) | DeepSeek (分析) | Kimi (首席研究)")
 
 # 1. Chat History Rendering
@@ -261,11 +253,30 @@ if user_input := st.chat_input("请输入标的..."):
     with st.chat_message("user", avatar="👤"):
         st.markdown(user_input)
 
-    # Router Step
+    # --- STEP 1: SMART ROUTER (Updated) ---
     with st.chat_message("assistant", avatar="👩‍💼"):
-        st.write("🔄 董秘正在立项...")
-        res, _ = call_agent("Router", SPECIFIC_MODELS["QWEN"], 
-                            "提取Yahoo Ticker。返回JSON {'ticker': '...'}", user_input)
+        st.write("🔍 董秘正在全网核实股票代码...")
+        
+        # 1. Use Tavily to find the ticker first (Search Augmentation)
+        search_res = search_web(f"{user_input} Yahoo Finance stock ticker code", "general")
+        search_context = "\n".join(search_res)
+        
+        # 2. Ask LLM to extract
+        router_prompt = f"""
+        用户想要分析: "{user_input}"
+        
+        网络搜索结果:
+        {search_context}
+        
+        请根据搜索结果，提取最准确的 Yahoo Finance Ticker。
+        - A股: 60xxxx.SS, 00xxxx.SZ, 30xxxx.SZ (如易点天下: 301171.SZ)
+        - 港股: xxxx.HK
+        - 美股: 字母代码 (如 NVDA)
+        
+        严格只返回JSON: {{'ticker': '...'}}
+        """
+        
+        res, _ = call_agent("Router", SPECIFIC_MODELS["QWEN"], "你是董秘。", router_prompt)
         
         json_data = extract_json_from_markdown(res)
         
@@ -275,7 +286,7 @@ if user_input := st.chat_input("请输入标的..."):
             st.session_state.process_status = "ANALYZING"
             st.rerun()
         else:
-            st.error(f"无法识别标的，AI返回：{res}")
+            st.error(f"无法识别标的，搜索结果: {search_context}")
             st.stop()
 
 # 3. Analysis Process
@@ -286,15 +297,12 @@ if st.session_state.process_status == "ANALYZING" and st.session_state.ticker:
     # --- STEP A: FETCH DATA ---
     if not st.session_state.market_data:
         with st.status("📡 正在进行全网情报搜集...", expanded=True) as status:
-            # Market Data (Concurrent)
             mkt = fetch_market_data(ticker)
-            st.session_state.market_data = mkt # Save even if offline to avoid loop
+            st.session_state.market_data = mkt
             
             if mkt['status'] == "OFFLINE":
                 st.error("行情数据获取失败 (Yahoo & Alpha Vantage 均不可用)")
-                # We continue with news only, but warn user
             
-            # Web Search (Tavily)
             queries = {
                 "macro": "global macro economy news market trends",
                 "meso": f"{ticker} industry competitors market share",
@@ -316,15 +324,14 @@ if st.session_state.process_status == "ANALYZING" and st.session_state.ticker:
     
     st.divider()
     
-    # 📈 行情看板 (如果数据可用)
+    # Dashboard
     if mkt and mkt['status'] != "OFFLINE":
         st.markdown(f"### 📉 行情看板: {mkt.get('name', ticker)} ({mkt.get('symbol')})")
-        
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("价格", f"{mkt['price']:.2f}", f"{mkt['change_pct']:.2f}%")
-        c2.metric("PE (静)", mkt.get('pe', 'N/A'))
+        c2.metric("PE", mkt.get('pe', 'N/A'))
         c3.metric("RSI", f"{mkt.get('last_rsi', 0):.1f}")
-        c4.metric("MACD柱", f"{mkt.get('last_macd', {}).get('hist', 0):.3f}")
+        c4.metric("MACD", f"{mkt.get('last_macd', {}).get('hist', 0):.3f}")
         
         if 'history_df' in mkt:
             fig = go.Figure(data=[go.Candlestick(x=mkt['history_df'].index,
@@ -333,35 +340,33 @@ if st.session_state.process_status == "ANALYZING" and st.session_state.ticker:
             fig.update_layout(height=350, template="plotly_white", margin=dict(l=0, r=0, t=10, b=0))
             st.plotly_chart(fig, use_container_width=True)
     else:
-        st.warning("⚠️ 暂无实时行情K线 (交易所接口无响应)，仅进行基本面分析。")
+        st.warning("⚠️ 暂无实时行情K线")
 
     st.subheader(f"🗣️ 投研会议 (第 {st.session_state.retry_count + 1} 轮)")
     if st.session_state.retry_count > 0:
         st.info(f"💡 本次会议包含了针对 **{st.session_state.last_rework_field}** 领域的补充情报。")
     
-    # Agents Speak
     with st.chat_message("assistant", avatar="🌍"):
         prompt = "简述宏观环境。"
-        if st.session_state.last_rework_field == "macro": prompt += " (请重点结合最新补充的宏观情报)"
+        if st.session_state.last_rework_field == "macro": prompt += " (基于最新补充情报)"
         res, _ = call_agent("Macro", SPECIFIC_MODELS["MINIMAX"], "你是宏观分析师。", f"{prompt}\n情报:{str(news['macro'])}")
         st.markdown(f"**宏观**: {res}")
         opinions['macro'] = res
 
     with st.chat_message("assistant", avatar="🏭"):
         prompt = f"分析 {ticker} 行业。"
-        if st.session_state.last_rework_field == "meso": prompt += " (请重点结合最新补充的行业情报)"
+        if st.session_state.last_rework_field == "meso": prompt += " (基于最新补充情报)"
         res, _ = call_agent("Meso", SPECIFIC_MODELS["MINIMAX"], f"你是行业分析师。", f"{prompt}\n情报:{str(news['meso'])}")
         st.markdown(f"**行业**: {res}")
         opinions['meso'] = res
 
     with st.chat_message("assistant", avatar="🔍"):
         prompt = f"分析 {ticker} 个股。"
-        if st.session_state.last_rework_field == "micro": prompt += " (请重点结合最新补充的个股情报)"
+        if st.session_state.last_rework_field == "micro": prompt += " (基于最新补充情报)"
         res, _ = call_agent("Micro", SPECIFIC_MODELS["MINIMAX"], f"你是公司研究员。", f"{prompt}\n情报:{str(news['micro'])}")
         st.markdown(f"**个股**: {res}")
         opinions['micro'] = res
     
-    # Quant only if market data exists
     if mkt and mkt['status'] != "OFFLINE":
         with st.chat_message("assistant", avatar="💹"):
             quant_ctx = f"Price:{mkt['price']}, PE:{mkt['pe']}, RSI:{mkt.get('last_rsi')}"
@@ -398,17 +403,17 @@ if st.session_state.process_status == "ANALYZING" and st.session_state.ticker:
         if "REWORK:" in review_res and st.session_state.retry_count < 1:
             match = re.search(r"REWORK:\s*(\w+)", review_res)
             field = match.group(1).lower() if match else "micro"
-            # Map random fields to known keys
-            if field not in ["macro", "meso", "micro"]: field = "micro"
+            # Fuzzy map to keys
+            if "macro" in field: field = "macro"
+            elif "indus" in field or "meso" in field: field = "meso"
+            else: field = "micro"
             
             st.session_state.last_rework_field = field
             st.warning(f"🚨 驳回：要求补充 **{field}** 领域信息。正在执行...")
             
-            # Supplement Search
             new_query = f"{ticker} {field} analysis latest news details"
             new_info = search_web(new_query, "general")
             
-            # Append new info specifically
             st.session_state.raw_news[field].extend(new_info)
             st.session_state.retry_count += 1
             st.rerun()
