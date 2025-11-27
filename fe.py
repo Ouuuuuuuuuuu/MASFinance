@@ -19,34 +19,50 @@ ALPHA_VANTAGE_KEY = "8G1QKAWN221XEZR8"
 
 # --- PAGE SETUP ---
 st.set_page_config(
-    page_title="MAS 联合研报终端 v3.5",
+    page_title="MAS 联合研报终端 v3.6",
     page_icon="🏦",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# --- CSS STYLING ---
+# --- CSS STYLING (Compact & Light) ---
 st.markdown("""
 <style>
-    .stApp { background-color: #ffffff; color: #1f2937; }
-    .stTextInput > div > div > input { background-color: #f3f4f6; color: #1f2937; }
-    .stChatMessage .stChatMessageAvatar { background-color: #e5e7eb; border-radius: 50%; }
-    div[data-testid="metric-container"] { background-color: #f9fafb; border: 1px solid #e5e7eb; padding: 10px; border-radius: 8px; }
+    /* Global Font & Colors */
+    .stApp { background-color: #ffffff; color: #333333; font-family: 'Source Sans Pro', sans-serif; }
     
+    /* Chat Message Styling */
+    .stChatMessage { padding: 1rem; }
+    .stChatMessage .stChatMessageAvatar { background-color: #f0f2f6; border-radius: 50%; }
+    
+    /* Compact Headers in Chat */
+    .stChatMessage h1, .stChatMessage h2, .stChatMessage h3 {
+        font-size: 1.1em !important;
+        font-weight: 700 !important;
+        margin-bottom: 0.5rem !important;
+        color: #1f2937;
+    }
+    .stChatMessage p { font-size: 0.95em !important; line-height: 1.6; }
+    
+    /* Thinking Box */
     .thinking-box {
         font-size: 0.85em;
         color: #6b7280;
         border-left: 3px solid #e5e7eb;
         padding-left: 10px;
-        margin-bottom: 10px;
+        margin: 5px 0;
         font-style: italic;
+        background: #f9fafb;
     }
+    
+    /* Input Field */
+    .stTextInput > div > div > input { background-color: #f9fafb; color: #1f2937; border: 1px solid #e5e7eb; }
 </style>
 """, unsafe_allow_html=True)
 
-# --- SESSION STATE INITIALIZATION ---
+# --- SESSION STATE ---
 if "messages" not in st.session_state:
-    st.session_state.messages = [{"role": "assistant", "content": "首席研究员就位。请下达调研指令（如：分析 易点天下）。", "avatar": "👨‍🔬"}]
+    st.session_state.messages = [{"role": "assistant", "content": "首席研究员就位。请下达调研指令（如：分析 比亚迪）。", "avatar": "👨‍🔬"}]
 if "process_status" not in st.session_state:
     st.session_state.process_status = "IDLE"
 if "ticker" not in st.session_state:
@@ -127,7 +143,7 @@ def fetch_from_alphavantage(ticker):
         df = calculate_technical_indicators(df)
         
         return {
-            "status": "ONLINE (AV Backup)",
+            "status": "ONLINE (AV)",
             "symbol": ticker.upper(),
             "name": ticker,
             "price": df['Close'].iloc[-1],
@@ -170,17 +186,17 @@ def fetch_market_data(ticker):
         
         yf_data = future_yf.result()
         if yf_data: return yf_data
-        
         av_data = future_av.result()
         if av_data: return av_data
         
-    return {"status": "OFFLINE", "error": "Market data unavailable from both YF and AV"}
+    return {"status": "OFFLINE", "error": "Market data unavailable"}
 
 def search_web(query, topic="general"):
     try:
         tavily = get_tavily_client()
         res = tavily.search(query=query, topic=topic, max_results=5)
-        return [f"- {r['title']}: {r['content'][:300]}" for r in res['results']]
+        # Ensure result snippet is not too long to save tokens
+        return [f"- {r['title']}: {r['content'][:200]}" for r in res['results']]
     except Exception as e:
         return [f"Search Error: {str(e)}"]
 
@@ -188,9 +204,11 @@ def call_agent(agent_name, model_id, system_prompt, user_prompt, thinking_needed
     client = get_llm_client()
     if not client: return "API Key Missing", ""
     
-    final_sys_prompt = system_prompt
+    # 强制注入中文指令
+    final_sys_prompt = system_prompt + "\nIMPORTANT: 请务必使用中文简体 (Chinese Simplified) 回复。"
+    
     if thinking_needed:
-        final_sys_prompt += "\nIMPORTANT: You MUST first output your internal thinking process wrapped in <thinking>...</thinking> tags, then output your final response."
+        final_sys_prompt += "\nLet's think step by step. First output your thinking process wrapped in <thinking>...</thinking>, then output your final response in Chinese."
 
     try:
         response = client.chat.completions.create(
@@ -223,23 +241,23 @@ SPECIFIC_MODELS = {
     "QWEN": "Qwen/Qwen2.5-72B-Instruct"
 }
 
-# --- MAIN UI LOGIC ---
+# --- MAIN UI ---
 
-st.title("🏦 MAS 联合研报终端 v3.5 (Verification Fixed)")
-st.caption(f"混合模型引擎: Qwen (路由) | MiniMax (情报) | DeepSeek (分析) | Kimi (首席研究)")
+st.title("🏦 MAS 联合研报终端 v3.6")
+st.caption("Powered by SiliconFlow Hybrid Models")
 
-# 1. Chat History Rendering
+# 1. History
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"], avatar=msg.get("avatar")):
         st.markdown(msg["content"])
         if msg.get("thinking"):
-            with st.expander("🧠 思考过程 (Thinking Chain)", expanded=False):
+            with st.expander("🧠 思考过程", expanded=False):
                 st.markdown(f"_{msg['thinking']}_")
 
-# 2. Input Handler
+# 2. Input
 if user_input := st.chat_input("请输入标的..."):
     if not silicon_flow_key:
-        st.error("请先在侧边栏输入 SiliconFlow API Key")
+        st.error("请配置 API Key")
         st.stop()
 
     st.session_state.ticker = None
@@ -253,102 +271,50 @@ if user_input := st.chat_input("请输入标的..."):
     with st.chat_message("user", avatar="👤"):
         st.markdown(user_input)
 
-    # --- STEP 1: SMART ROUTER (Verification Added) ---
+    # Router
     with st.chat_message("assistant", avatar="👩‍💼"):
-        st.write("🔍 董秘正在核实代码...")
-        
-        # 1. Double Search (English + Chinese)
-        # English search is good for tickers, Chinese search ensures we get A-share context
+        st.write("🔍 董秘正在核实...")
+        # Double Search for better context
         with concurrent.futures.ThreadPoolExecutor() as executor:
-            f_en = executor.submit(search_web, f"{user_input} stock ticker Yahoo Finance", "general")
-            f_cn = executor.submit(search_web, f"{user_input} 股票代码", "general")
-            search_res = f_en.result() + f_cn.result()
+            f1 = executor.submit(search_web, f"{user_input} 股票代码", "general")
+            f2 = executor.submit(search_web, f"{user_input} stock ticker", "general")
+            search_res = f1.result() + f2.result()
         
-        search_context = "\n".join(search_res)
-        
-        # 2. Extract
         router_prompt = f"""
-        用户想要分析: "{user_input}"
-        
-        搜索结果:
-        {search_context}
-        
-        请提取Yahoo Finance Ticker。
-        规则：
-        1. A股必须是 6 位数字 + .SS (上海) 或 .SZ (深圳)。例如 301171 -> 301171.SZ
-        2. 港股是 4 位数字 + .HK
-        3. 美股是字母
-        4. 务必区分“易点天下(301171)”和“中科润宇(301175)”等相似代码，依靠搜索结果中的公司名匹配。
-        
-        返回JSON: {{'ticker': '...', 'company_name_in_search': '...'}}
+        用户输入: "{user_input}"
+        搜索线索: {json.dumps(search_res, ensure_ascii=False)}
+        请提取准确的 Yahoo Finance Ticker。
+        规则：A股(6位数字+.SS/.SZ), 港股(4位数字+.HK), 美股(字母)。
+        只返回JSON: {{'ticker': '...'}}
         """
-        
-        res, _ = call_agent("Router", SPECIFIC_MODELS["QWEN"], "你是董秘。精确提取代码。", router_prompt)
+        res, _ = call_agent("Router", SPECIFIC_MODELS["QWEN"], "你是董秘。", router_prompt)
         json_data = extract_json_from_markdown(res)
         
         if json_data and 'ticker' in json_data:
-            ticker_candidate = json_data['ticker']
-            
-            # 3. IDENTITY VERIFICATION (New Step)
-            # Fetch real name from YFinance to double check
-            try:
-                real_info = yf.Ticker(ticker_candidate).info
-                real_name = real_info.get('longName', '') or real_info.get('shortName', '')
-                
-                if real_name:
-                    # Let Qwen confirm if "real_name" matches "user_input"
-                    verify_prompt = f"""
-                    用户输入: "{user_input}"
-                    提取代码: "{ticker_candidate}"
-                    该代码对应的官方名称: "{real_name}"
-                    
-                    请判断官方名称是否与用户输入匹配？
-                    如果匹配，返回 "YES"。
-                    如果不匹配（例如用户搜易点天下，但代码对应中科润宇），返回 "NO"。
-                    """
-                    verify_res, _ = call_agent("Verifier", SPECIFIC_MODELS["QWEN"], "你是审核员。", verify_prompt)
-                    
-                    if "NO" in verify_res:
-                        st.error(f"⚠️ 警告：代码 {ticker_candidate} 对应公司为 **{real_name}**，似乎与您的输入不符。请尝试输入更准确的全名。")
-                        st.stop()
-                    else:
-                        st.session_state.ticker = ticker_candidate
-                        st.markdown(f"✅ 身份核验通过：**{real_name} ({ticker_candidate})**")
-                        st.session_state.process_status = "ANALYZING"
-                        st.rerun()
-                else:
-                    # Fallback if YF fails to get name (e.g. network issue), trust LLM but warn
-                    st.warning(f"⚠️ 无法从交易所验证代码 {ticker_candidate}，将尝试强行分析...")
-                    st.session_state.ticker = ticker_candidate
-                    st.session_state.process_status = "ANALYZING"
-                    st.rerun()
-            except Exception as e:
-                st.error(f"代码验证失败: {str(e)}")
-                st.stop()
-                
+            st.session_state.ticker = json_data['ticker']
+            st.markdown(f"✅ 确认标的：**{st.session_state.ticker}**")
+            st.session_state.process_status = "ANALYZING"
+            st.rerun()
         else:
-            st.error("无法识别有效代码")
+            st.error(f"无法识别代码: {res}")
             st.stop()
 
-# 3. Analysis Process
+# 3. Execution
 if st.session_state.process_status == "ANALYZING" and st.session_state.ticker:
-    
     ticker = st.session_state.ticker
     
-    # --- STEP A: FETCH DATA ---
+    # A. Data Fetching
     if not st.session_state.market_data:
-        with st.status("📡 正在进行全网情报搜集...", expanded=True) as status:
+        with st.status("📡 全网情报搜集...", expanded=True) as status:
             mkt = fetch_market_data(ticker)
             st.session_state.market_data = mkt
             
-            if mkt['status'] == "OFFLINE":
-                st.error("行情数据获取失败 (Yahoo & Alpha Vantage 均不可用)")
-            
+            # 泛化搜索关键词
             queries = {
-                "macro": "global macro economy news market trends",
-                "meso": f"{ticker} industry competitors market share",
-                "micro": f"{ticker} stock news financial reports analysis",
-                "pol": "international geopolitics trade war impact"
+                "macro": "全球宏观经济新闻 市场趋势 2024",
+                "meso": f"{ticker} 行业分析 竞争对手 市场份额",
+                "micro": f"{ticker} 最新新闻 财报分析 机构评级",
+                "pol": "国际地缘政治 贸易政策 风险"
             }
             
             with concurrent.futures.ThreadPoolExecutor() as executor:
@@ -356,18 +322,17 @@ if st.session_state.process_status == "ANALYZING" and st.session_state.ticker:
                 for k, f in futures.items():
                     st.session_state.raw_news[k] = f.result()
             
-            status.update(label="✅ 初始情报已就绪", state="complete")
+            status.update(label="✅ 情报就绪", state="complete")
     
-    # --- STEP B: MEETING ---
+    # B. Meeting
     mkt = st.session_state.market_data
     news = st.session_state.raw_news
     opinions = {}
     
     st.divider()
     
-    # Dashboard
+    # Market Board
     if mkt and mkt['status'] != "OFFLINE":
-        st.markdown(f"### 📉 行情看板: {mkt.get('name', ticker)} ({mkt.get('symbol')})")
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("价格", f"{mkt['price']:.2f}", f"{mkt['change_pct']:.2f}%")
         c2.metric("PE", mkt.get('pe', 'N/A'))
@@ -378,91 +343,98 @@ if st.session_state.process_status == "ANALYZING" and st.session_state.ticker:
             fig = go.Figure(data=[go.Candlestick(x=mkt['history_df'].index,
                             open=mkt['history_df']['Open'], high=mkt['history_df']['High'],
                             low=mkt['history_df']['Low'], close=mkt['history_df']['Close'])])
-            fig.update_layout(height=350, template="plotly_white", margin=dict(l=0, r=0, t=10, b=0))
+            fig.update_layout(height=300, template="plotly_white", margin=dict(l=0, r=0, t=10, b=0))
             st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.warning("⚠️ 暂无实时行情K线")
-
-    st.subheader(f"🗣️ 投研会议 (第 {st.session_state.retry_count + 1} 轮)")
-    if st.session_state.retry_count > 0:
-        st.info(f"💡 本次会议包含了针对 **{st.session_state.last_rework_field}** 领域的补充情报。")
     
-    with st.chat_message("assistant", avatar="🌍"):
-        prompt = "简述宏观环境。"
-        if st.session_state.last_rework_field == "macro": prompt += " (基于最新补充情报)"
-        res, _ = call_agent("Macro", SPECIFIC_MODELS["MINIMAX"], "你是宏观分析师。", f"{prompt}\n情报:{str(news['macro'])}")
-        st.markdown(f"**宏观**: {res}")
-        opinions['macro'] = res
-
-    with st.chat_message("assistant", avatar="🏭"):
-        prompt = f"分析 {ticker} 行业。"
-        if st.session_state.last_rework_field == "meso": prompt += " (基于最新补充情报)"
-        res, _ = call_agent("Meso", SPECIFIC_MODELS["MINIMAX"], f"你是行业分析师。", f"{prompt}\n情报:{str(news['meso'])}")
-        st.markdown(f"**行业**: {res}")
-        opinions['meso'] = res
-
-    with st.chat_message("assistant", avatar="🔍"):
-        prompt = f"分析 {ticker} 个股。"
-        if st.session_state.last_rework_field == "micro": prompt += " (基于最新补充情报)"
-        res, _ = call_agent("Micro", SPECIFIC_MODELS["MINIMAX"], f"你是公司研究员。", f"{prompt}\n情报:{str(news['micro'])}")
-        st.markdown(f"**个股**: {res}")
-        opinions['micro'] = res
+    # Agent Meeting
+    round_num = st.session_state.retry_count + 1
+    st.markdown(f"#### 🗣️ 投研会议 (Round {round_num})")
     
-    if mkt and mkt['status'] != "OFFLINE":
-        with st.chat_message("assistant", avatar="💹"):
-            quant_ctx = f"Price:{mkt['price']}, PE:{mkt['pe']}, RSI:{mkt.get('last_rsi')}"
-            res, _ = call_agent("Finance", SPECIFIC_MODELS["DEEPSEEK"], "评价估值与技术面。", quant_ctx)
-            st.markdown(f"**量化**: {res}")
-            opinions['quant'] = res
-    else:
-        quant_ctx = "Market Data Offline"
+    if st.session_state.last_rework_field:
+        st.info(f"💡 本轮针对 **{st.session_state.last_rework_field}** 进行了补充调查。")
 
-    # --- STEP C: DRAFTING ---
+    with st.container():
+        col1, col2 = st.columns(2)
+        with col1:
+            # Macro
+            prompt = "简述宏观环境。"
+            res, _ = call_agent("Macro", SPECIFIC_MODELS["MINIMAX"], "你是宏观分析师。", f"{prompt}\n情报:{str(news['macro'])}")
+            st.markdown(f"**🌍 宏观**: {res}")
+            opinions['macro'] = res
+            
+            # Micro
+            res, _ = call_agent("Micro", SPECIFIC_MODELS["MINIMAX"], f"分析 {ticker} 个股。", f"情报:{str(news['micro'])}")
+            st.markdown(f"**🔍 个股**: {res}")
+            opinions['micro'] = res
+
+        with col2:
+            # Meso
+            res, _ = call_agent("Meso", SPECIFIC_MODELS["MINIMAX"], f"分析 {ticker} 行业。", f"情报:{str(news['meso'])}")
+            st.markdown(f"**🏭 行业**: {res}")
+            opinions['meso'] = res
+            
+            # Quant
+            if mkt['status'] != "OFFLINE":
+                quant_ctx = f"Price:{mkt['price']}, PE:{mkt['pe']}, RSI:{mkt.get('last_rsi')}"
+                res, _ = call_agent("Finance", SPECIFIC_MODELS["DEEPSEEK"], "评价估值与技术面。", quant_ctx)
+                st.markdown(f"**💹 量化**: {res}")
+                opinions['quant'] = res
+            else:
+                quant_ctx = "Market Data Offline"
+
+    # C. Drafting
     with st.chat_message("assistant", avatar="📝"):
-        st.write("✍️ 正在撰写研报草案...")
+        st.write("✍️ **综合分析师** 正在撰写研报...")
         full_ctx = f"Opinions:{json.dumps(opinions, ensure_ascii=False)}\nMarket:{quant_ctx}"
         report_draft, _ = call_agent("Analyst", SPECIFIC_MODELS["DEEPSEEK"], 
-                            "写一份结构化研报，包含逻辑、风险和结论。", full_ctx)
+                            "写一份结构化研报(Markdown)。包含：核心逻辑、风险提示、结论。", full_ctx)
         st.markdown(report_draft)
 
-    # --- STEP D: CHIEF REVIEW ---
+    # D. Chief Review
     with st.chat_message("assistant", avatar="👨‍🔬"):
-        st.write("🕵️ **首席研究员 (Kimi)** 正在审核...")
+        st.write("🕵️ **首席研究员** 正在审核...")
+        
+        is_final_round = st.session_state.retry_count >= 1
         
         review_prompt = f"""
         你是首席研究员。审查研报。
-        1. 若信息严重缺失，输出指令：REWORK: [MACRO/MESO/MICRO]
-        2. 若通过，输出最终投资建议。
-        研报: {report_draft}
+        
+        当前是第 {round_num} 轮审核。
+        
+        1. 如果信息严重缺失且还可以返工（当前不是最后一轮），请输出指令：REWORK: [MACRO/MESO/MICRO]。
+        2. 如果信息足够，或者已经是最后一轮（Round 2），请必须给出最终结论。
+        
+        研报内容:
+        {report_draft}
         """
+        
         review_res, thinking = call_agent("Chief", SPECIFIC_MODELS["KIMI"], review_prompt, "开始审核", thinking_needed=True)
         
         if thinking:
             with st.expander("🧠 思考过程", expanded=True):
                 st.markdown(f"_{thinking}_")
         
-        if "REWORK:" in review_res and st.session_state.retry_count < 1:
+        # Logic
+        if "REWORK:" in review_res and not is_final_round:
             match = re.search(r"REWORK:\s*(\w+)", review_res)
             field = match.group(1).lower() if match else "micro"
-            # Fuzzy map to keys
-            if "macro" in field: field = "macro"
-            elif "indus" in field or "meso" in field: field = "meso"
-            else: field = "micro"
+            if field not in ["macro", "meso", "micro"]: field = "micro"
             
             st.session_state.last_rework_field = field
             st.warning(f"🚨 驳回：要求补充 **{field}** 领域信息。正在执行...")
             
-            new_query = f"{ticker} {field} analysis latest news details"
+            new_query = f"{ticker} {field} deep analysis details"
             new_info = search_web(new_query, "general")
-            
             st.session_state.raw_news[field].extend(new_info)
             st.session_state.retry_count += 1
+            time.sleep(1)
             st.rerun()
             
         else:
             st.success("✅ 审核通过")
-            st.markdown(f"### 🏆 最终决策\n{review_res}")
+            st.markdown(f"### 🏆 最终决策\n\n{review_res}")
             
+            # Save Result
             st.session_state.messages.append({
                 "role": "assistant", 
                 "content": f"### 📑 最终研报 ({ticker})\n\n{report_draft}\n\n---\n**🏆 首席决策**: {review_res}", 
