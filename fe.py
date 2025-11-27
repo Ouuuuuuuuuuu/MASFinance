@@ -13,9 +13,14 @@ import requests
 import feedparser
 import re
 
+# --- HARDCODED KEYS (Hidden from UI) ---
+# 预填好的 Key，不在界面显示
+TAVILY_API_KEY = "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"
+ALPHA_VANTAGE_KEY = "8G1QKAWN221XEZR8"
+
 # --- PAGE SETUP ---
 st.set_page_config(
-    page_title="MAS 联合研报终端 v3.1 (Fix)",
+    page_title="MAS 联合研报终端 v3.2",
     page_icon="🏦",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -40,12 +45,11 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- SESSION STATE INITIALIZATION (CRITICAL FIX) ---
-# 修复逻辑错误核心：所有跨 Rerun 的数据必须存入 Session State
+# --- SESSION STATE INITIALIZATION ---
 if "messages" not in st.session_state:
     st.session_state.messages = [{"role": "assistant", "content": "首席研究员就位。请下达调研指令（如：分析 特斯拉）。", "avatar": "👨‍🔬"}]
 if "process_status" not in st.session_state:
-    st.session_state.process_status = "IDLE" # IDLE, ANALYZING, REVIEWING, DONE
+    st.session_state.process_status = "IDLE"
 if "ticker" not in st.session_state:
     st.session_state.ticker = None
 if "market_data" not in st.session_state:
@@ -54,28 +58,20 @@ if "raw_news" not in st.session_state:
     st.session_state.raw_news = {}
 if "retry_count" not in st.session_state:
     st.session_state.retry_count = 0
-if "final_report" not in st.session_state:
-    st.session_state.final_report = None
 
-# --- SIDEBAR & SECRETS ---
+# --- SIDEBAR ---
 with st.sidebar:
     st.title("🎛️ 控制台")
     st.subheader("🔑 鉴权设置")
     
-    # 优先尝试从 st.secrets 读取，如果没配置，则显示输入框
-    # 这种方式既安全（GitHub不泄露）又方便（本地测试可以直接填）
-    
+    # 只显示 SiliconFlow Key 输入框
     default_sf_key = st.secrets.get("SILICON_FLOW_KEY", "")
-    silicon_flow_key = st.text_input("SiliconFlow Key", value=default_sf_key, type="password")
-    
-    default_tavily = st.secrets.get("TAVILY_API_KEY", "")
-    tavily_api_key = st.text_input("Tavily Key", value=default_tavily, type="password")
-    
-    default_av = st.secrets.get("ALPHA_VANTAGE_KEY", "")
-    alpha_vantage_key = st.text_input("Alpha Vantage Key", value=default_av, type="password")
+    silicon_flow_key = st.text_input("SiliconFlow Key", value=default_sf_key, type="password", help="请输入您的硅基流动 API Key")
 
-    if not silicon_flow_key or not tavily_api_key:
-        st.warning("⚠️ 请填入必要的 API Key")
+    if not silicon_flow_key:
+        st.warning("⚠️ 请输入 SiliconFlow API Key 以启动大模型")
+    else:
+        st.success("✅ 系统已就绪")
     
     st.divider()
     if st.button("🔄 重置系统状态"):
@@ -83,15 +79,12 @@ with st.sidebar:
             del st.session_state[key]
         st.rerun()
 
-# --- ROBUST UTILS ---
+# --- UTILS ---
 
 def extract_json_from_markdown(text):
-    """Robust JSON extraction using Regex to find { ... } block."""
     try:
-        # 尝试直接解析
         return json.loads(text)
     except json.JSONDecodeError:
-        # 正则提取第一个 JSON 对象
         match = re.search(r"\{.*\}", text, re.DOTALL)
         if match:
             try:
@@ -105,7 +98,8 @@ def get_llm_client():
     return OpenAI(api_key=silicon_flow_key, base_url="https://api.siliconflow.cn/v1")
 
 def get_tavily_client():
-    return TavilyClient(api_key=tavily_api_key)
+    # 直接使用硬编码的 Key
+    return TavilyClient(api_key=TAVILY_API_KEY)
 
 def calculate_technical_indicators(df):
     if df.empty: return df
@@ -121,11 +115,40 @@ def calculate_technical_indicators(df):
     df['RSI'] = 100 - (100 / (1 + rs))
     return df
 
+# 增加 Alpha Vantage 作为备用数据源
+def fetch_alpha_vantage_data(ticker):
+    url = f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol={ticker}&apikey={ALPHA_VANTAGE_KEY}&outputsize=compact"
+    try:
+        r = requests.get(url)
+        data = r.json()
+        if "Time Series (Daily)" not in data: raise ValueError("AV No Data")
+        
+        df = pd.DataFrame.from_dict(data["Time Series (Daily)"], orient='index')
+        df = df.rename(columns={"4. close": "Close", "1. open": "Open", "2. high": "High", "3. low": "Low"})
+        df = df.astype(float).sort_index()
+        df = calculate_technical_indicators(df)
+        
+        return {
+            "status": "ONLINE (AV Backup)",
+            "symbol": ticker.upper(),
+            "name": ticker,
+            "price": df['Close'].iloc[-1],
+            "change_pct": 0.0, # AV Daily 不提供实时涨跌
+            "pe": "N/A",
+            "cap": "N/A",
+            "history_df": df,
+            "last_macd": {"hist": df['MACD_Hist'].iloc[-1]},
+            "last_rsi": df['RSI'].iloc[-1]
+        }
+    except Exception as e:
+        raise e
+
 def fetch_market_data(ticker):
+    # 优先尝试 yfinance
     try:
         stock = yf.Ticker(ticker)
         hist = stock.history(period="6mo")
-        if hist.empty: raise ValueError("Empty Data")
+        if hist.empty: raise ValueError("YF Empty Data")
         hist = calculate_technical_indicators(hist)
         info = stock.info
         return {
@@ -141,7 +164,11 @@ def fetch_market_data(ticker):
             "last_rsi": hist['RSI'].iloc[-1]
         }
     except:
-        return {"status": "OFFLINE", "error": "Market data unavailable"}
+        # 失败则尝试 Alpha Vantage
+        try:
+            return fetch_alpha_vantage_data(ticker)
+        except:
+            return {"status": "OFFLINE", "error": "Market data unavailable from both YF and AV"}
 
 def search_web(query, topic="general"):
     try:
@@ -171,7 +198,6 @@ def call_agent(agent_name, model_id, system_prompt, user_prompt, thinking_needed
         )
         content = response.choices[0].message.content
         
-        # Parse Thinking
         thinking = ""
         if "<thinking>" in content:
             match = re.search(r"<thinking>(.*?)</thinking>", content, re.DOTALL)
@@ -193,7 +219,7 @@ SPECIFIC_MODELS = {
 
 # --- MAIN UI LOGIC ---
 
-st.title("🏦 MAS 联合研报终端 v3.1")
+st.title("🏦 MAS 联合研报终端 v3.2")
 st.caption(f"混合模型引擎: Qwen (路由) | MiniMax (情报) | DeepSeek (分析) | Kimi (首席研究)")
 
 # 1. Chat History Rendering
@@ -206,11 +232,10 @@ for msg in st.session_state.messages:
 
 # 2. Input Handler
 if user_input := st.chat_input("请输入标的..."):
-    if not silicon_flow_key or not tavily_api_key:
-        st.error("请先在侧边栏配置 API Key")
+    if not silicon_flow_key:
+        st.error("请先在侧边栏输入 SiliconFlow API Key")
         st.stop()
 
-    # Clear previous session data for new query
     st.session_state.ticker = None
     st.session_state.market_data = None
     st.session_state.raw_news = {}
@@ -227,31 +252,34 @@ if user_input := st.chat_input("请输入标的..."):
         res, _ = call_agent("Router", SPECIFIC_MODELS["QWEN"], 
                             "提取Yahoo Ticker。返回JSON {'ticker': '...'}", user_input)
         
-        json_data = extract_json_from_markdown(res) # Robust JSON Parsing
+        json_data = extract_json_from_markdown(res)
         
         if json_data and 'ticker' in json_data:
             st.session_state.ticker = json_data['ticker']
             st.markdown(f"✅ 标的确认：**{st.session_state.ticker}**")
             st.session_state.process_status = "ANALYZING"
-            st.rerun() # Force rerun to enter analysis phase with state
+            st.rerun()
         else:
             st.error(f"无法识别标的，AI返回：{res}")
             st.stop()
 
-# 3. Analysis Process (Triggered by State)
+# 3. Analysis Process
 if st.session_state.process_status == "ANALYZING" and st.session_state.ticker:
     
     ticker = st.session_state.ticker
     
-    # --- STEP A: FETCH DATA (Only if missing) ---
+    # --- STEP A: FETCH DATA ---
     if not st.session_state.market_data:
         with st.status("📡 正在进行全网情报搜集...", expanded=True) as status:
+            # Market Data (YFinance -> Alpha Vantage)
             mkt = fetch_market_data(ticker)
             if mkt['status'] == "OFFLINE":
-                st.error("行情数据获取失败")
+                status.update(label="❌ 数据获取失败", state="error")
+                st.error(mkt.get('error'))
                 st.stop()
             st.session_state.market_data = mkt
             
+            # Web Search (Tavily)
             queries = {
                 "macro": "global macro economy news market trends",
                 "meso": f"{ticker} industry competitors market share",
@@ -266,14 +294,13 @@ if st.session_state.process_status == "ANALYZING" and st.session_state.ticker:
             
             status.update(label="✅ 初始情报已就绪", state="complete")
     
-    # --- STEP B: MEETING (Display Opinions) ---
+    # --- STEP B: MEETING ---
     mkt = st.session_state.market_data
     news = st.session_state.raw_news
     opinions = {}
     
     st.subheader(f"🗣️ 投研会议 (Round {st.session_state.retry_count + 1})")
     
-    # Agents speak
     with st.chat_message("assistant", avatar="🌍"):
         res, _ = call_agent("Macro", SPECIFIC_MODELS["MINIMAX"], "简述宏观环境。", str(news['macro']))
         st.markdown(f"**宏观**: {res}")
@@ -319,33 +346,26 @@ if st.session_state.process_status == "ANALYZING" and st.session_state.ticker:
             with st.expander("🧠 思考过程", expanded=True):
                 st.markdown(f"_{thinking}_")
         
-        # Logic for Rework vs Finalize
         if "REWORK:" in review_res and st.session_state.retry_count < 1:
-            # REWORK FLOW
             match = re.search(r"REWORK:\s*(\w+)", review_res)
             field = match.group(1).lower() if match else "micro"
             if field not in st.session_state.raw_news: field = "micro"
             
             st.warning(f"🚨 驳回：要求补充 **{field}** 领域信息。正在执行...")
-            
-            # Supplement Search
             new_query = f"{ticker} {field} deep analysis recent news"
             new_info = search_web(new_query, "general")
-            st.session_state.raw_news[field].extend(new_info) # Append Data
-            
-            st.session_state.retry_count += 1 # Increment Retry
-            st.rerun() # Restart analysis with new data
+            st.session_state.raw_news[field].extend(new_info)
+            st.session_state.retry_count += 1
+            st.rerun()
             
         else:
-            # SUCCESS FLOW
             st.success("✅ 审核通过")
             st.markdown(f"### 🏆 最终决策\n{review_res}")
             
-            # Save final result to history
             st.session_state.messages.append({
                 "role": "assistant", 
                 "content": f"### 📑 最终研报 ({ticker})\n\n{report_draft}\n\n---\n**🏆 首席决策**: {review_res}", 
-                "avatar": "👨‍🔬",
+                "avatar": "👨‍🔬", 
                 "thinking": thinking
             })
-            st.session_state.process_status = "DONE" # Mark as done
+            st.session_state.process_status = "DONE"
