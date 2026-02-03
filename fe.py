@@ -14,7 +14,7 @@ from datetime import datetime
 
 # --- PAGE SETUP ---
 st.set_page_config(
-    page_title="MAS 联合研报终端 v4.5",
+    page_title="MAS 联合研报终端 v5.0",
     page_icon="🏦",
     layout="wide",
     initial_sidebar_state="expanded"
